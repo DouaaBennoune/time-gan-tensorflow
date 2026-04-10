@@ -1,5 +1,11 @@
 import numpy as np
 import tensorflow as tf
+from time_gan_tensorflow.utils import time_series_to_sequences, sequences_to_time_series
+from time_gan_tensorflow.modules import encoder_embedder, encoder, decoder, generator_embedder, generator, discriminator, simulator
+from time_gan_tensorflow.losses import binary_crossentropy, mean_squared_error
+# extract the length of the time series
+import numpy as np
+import tensorflow as tf
 
 from time_gan_tensorflow.utils import time_series_to_sequences, sequences_to_time_series
 from time_gan_tensorflow.modules import encoder_embedder, encoder, decoder, generator_embedder, generator, discriminator, simulator
@@ -19,32 +25,42 @@ class TimeGAN():
         Implementation of synthetic time series generation model introduced in Yoon, J., Jarrett, D. and Van der Schaar, M., 2019.
         Time-series generative adversarial networks. Advances in neural information processing systems, 32.
         '''
-        
-        # extract the length of the time series
+        self.input_shape = len(x.shape) 
         samples = x.shape[0]
-
+        #fix 1 : Input flexibility , Pre-windowed data supported
         # extract the number of time series
-        features = x.shape[1]
+        if len(x.shape) == 3:
+            features = x.shape[2]
+        else:
+            features = x.shape[1]
 
         # scale the time series
-        mu = np.mean(x, axis=0)
-        sigma = np.std(x, axis=0)
-        x = (x - mu) / sigma
+        if len(x.shape) == 3:
+            mu = np.mean(x, axis=(0,1))      # mean over samples and timesteps → shape (features,)
+            sigma = np.std(x, axis=(0,1))    # std over samples and timesteps → shape (features,)
+               
+        else: 
+            mu = np.mean(x, axis=0)
+            sigma = np.std(x, axis=0)
+        # fix 2 :  Prevent Division by Zero.    
+        sigma = np.where(sigma == 0, 1.0, sigma)    
+        x = (x - mu) / sigma   
 
         # reshape the time series as sequences
-        x = time_series_to_sequences(time_series=x, timesteps=timesteps)
+        if len(x.shape) == 3:
+            pass  # already windowed
+        else:
+            x = time_series_to_sequences(time_series=x, timesteps=timesteps)
         
-        # create the dataset
-        dataset = tf.data.Dataset.from_tensor_slices(x)
-        dataset = dataset.cache().shuffle(samples).batch(batch_size).prefetch(tf.data.experimental.AUTOTUNE)
         
+
         # build the models
         autoencoder_model = tf.keras.models.Sequential([
             encoder_embedder(timesteps=timesteps, features=features, hidden_dim=hidden_dim, num_layers=1),
             encoder(timesteps=timesteps, hidden_dim=hidden_dim, num_layers=num_layers - 1),
             decoder(timesteps=timesteps, features=features, hidden_dim=hidden_dim, num_layers=num_layers)
         ])
-    
+
         generator_model = tf.keras.models.Sequential([
             generator_embedder(timesteps=timesteps, features=features, hidden_dim=hidden_dim, num_layers=1),
             generator(timesteps=timesteps, hidden_dim=hidden_dim, num_layers=num_layers - 1),
@@ -65,14 +81,16 @@ class TimeGAN():
         self.features = features
         self.lambda_param = lambda_param
         self.eta_param = eta_param
-        self.dataset = dataset
+        #fix 3 : overlap data transfer with GPU computation, which can help reduce the CPU bottleneck
+        self.dataset = tf.data.Dataset.from_tensor_slices(x)
+        self.dataset = self.dataset.shuffle(buffer_size=len(x)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
         self.autoencoder_model = autoencoder_model
         self.generator_model = generator_model
         self.discriminator_model = discriminator_model
         self.autoencoder_optimizer = autoencoder_optimizer
         self.generator_optimizer = generator_optimizer
         self.discriminator_optimizer = discriminator_optimizer
-    
+
     def fit(self, epochs, verbose=True):
         '''
         Train the model.
@@ -112,18 +130,18 @@ class TimeGAN():
                 
                 # calculate the autoencoder loss
                 autoencoder_loss = mean_squared_error(x, x_hat) + \
-                                   self.lambda_param * supervised_loss
-                                   
+                                self.lambda_param * supervised_loss
+                                
                 # calculate the generator loss
                 generator_loss = binary_crossentropy(tf.ones_like(p_hz), p_hz) + \
-                                 binary_crossentropy(tf.ones_like(p_ez), p_ez) + \
-                                 self.eta_param * supervised_loss
+                                binary_crossentropy(tf.ones_like(p_ez), p_ez) + \
+                                self.eta_param * supervised_loss
 
                 # calculate the discriminator loss
                 discriminator_loss = binary_crossentropy(tf.zeros_like(p_hz), p_hz) + \
-                                     binary_crossentropy(tf.zeros_like(p_ez), p_ez) + \
-                                     binary_crossentropy(tf.ones_like(p_hx), p_hx) + \
-                                     binary_crossentropy(tf.ones_like(p_ex), p_ex)
+                                    binary_crossentropy(tf.zeros_like(p_ez), p_ez) + \
+                                    binary_crossentropy(tf.ones_like(p_hx), p_hx) + \
+                                    binary_crossentropy(tf.ones_like(p_ex), p_ex)
             
             # calculate the gradients
             autoencoder_gradient = autoencoder_tape.gradient(autoencoder_loss, self.autoencoder_model.trainable_variables)
@@ -158,34 +176,47 @@ class TimeGAN():
         x = (x - self.mu) / self.sigma
 
         # reshape the time series as sequences
-        x = time_series_to_sequences(time_series=x, timesteps=self.timesteps)
+        if len(x.shape) == 3:
+            pass  # already windowed
+        else:
+            x = time_series_to_sequences(time_series=x, timesteps=self.timesteps)
 
         # get the reconstructed sequences
         x_hat = self.autoencoder_model(x)
         
         # transform the reconstructed sequences back to time series
         x_hat = sequences_to_time_series(x_hat.numpy())
-   
+
         # transform the reconstructed time series back to the original scale
         x_hat = self.mu + self.sigma * x_hat
         
         return x_hat
-    
-    def simulate(self, samples):
+
+    def simulate(self, num_sequences):
         '''
         Simulate the time series.
+
         '''
-        
         # generate the synthetic sequences
-        z = simulator(samples=samples // self.timesteps, timesteps=self.timesteps, features=self.features)
+        # Pass the exact number of sequences you want to generate
+        
+        # in practice :
+        # If your original data had N timesteps and you want to match it:
+        # num_sequences = len(original_data) // model.timesteps
+        # synthetic_data = model.simulate(num_sequences=num_sequences)
+        z = simulator(samples=num_sequences , timesteps=self.timesteps, features=self.features)
         
         # get the simulated sequences
         x_sim = self.autoencoder_model.get_layer('decoder')(self.generator_model(z))
-    
+
         # transform the simulated sequences back to time series
-        x_sim = sequences_to_time_series(x_sim.numpy())
-    
+        if self.input_shape == 3:
+            x_sim = x_sim.numpy()
+        else:
+            x_sim = sequences_to_time_series(x_sim.numpy())
+        
+
         # transform the simulated time series back to the original scale
         x_sim = self.mu + self.sigma * x_sim
-    
+
         return x_sim
